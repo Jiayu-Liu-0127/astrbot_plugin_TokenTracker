@@ -1,0 +1,24 @@
+{
+  "interval_hours": {
+    "type": "float",
+    "description": "自动统计间隔（小时）",
+    "hint": "超过此时间未使用/token，AI回复后会自动输出统计信息",
+    "default": 24.0,
+    "slider": {
+      "min": 1,
+      "max": 720,
+      "step": 1
+    }
+  },
+  "session_ttl_hours": {
+    "type": "float",
+    "description": "会话过期时间（小时）",
+    "hint": "会话无活动超过此时间会被自动清理，避免内存泄漏",
+    "default": 72.0,
+    "slider": {
+      "min": 1,
+      "max": 720,
+      "step": 1
+    }
+  }
+}
