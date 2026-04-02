@@ -18,7 +18,7 @@
 ```bash
 # 克隆仓库到插件目录
 cd /AstrBot/data/plugins
-git clone https://github.com/Jiayu-Liu-0127/astrbot_plugin_token_tracker
+git clone https://github.com/Jiayu-Liu-0127/astrbot_plugin_Token_Tracker
 
 # 控制台重启AstrBot
 ```
