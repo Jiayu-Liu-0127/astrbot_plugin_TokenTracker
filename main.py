@@ -1,6 +1,5 @@
-import asyncio
 import time
-from typing import Dict, Optional
+from typing import Dict
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger, AstrBotConfig
@@ -12,12 +11,16 @@ from astrbot.core.provider.entites import LLMResponse
 class TokenTracker(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
-        # 存储结构: {session_id: {"current": stats, "last_token_time": timestamp, "pending_auto": bool}}
+        # 存储结构: {session_id: {"current": stats, "last_token_time": timestamp, "last_active_time": timestamp, "pending_auto": bool}}
         self.stats: Dict[str, Dict] = {}
         # 从配置获取参数
         self.config = config
         self.auto_interval_hours = float(self.config.get("interval_hours", 24.0))
         self.session_ttl = float(self.config.get("session_ttl_hours", 72.0)) * 60 * 60  # 转换为秒
+        
+        # 清理性能优化：设置清理间隔（秒）
+        self.cleanup_interval = 300  # 5分钟清理一次
+        self.last_cleanup_time = time.monotonic()
         
         logger.info(f"TokenTracker插件已加载，自动统计间隔: {self.auto_interval_hours}小时，会话过期时间: {self.session_ttl/3600:.1f}小时")
     
@@ -36,6 +39,7 @@ class TokenTracker(Star):
                 "current": None, 
                 "last_token_time": None,
                 "session_start": time.monotonic(),
+                "last_active_time": time.monotonic(),  # 最后活跃时间
                 "pending_auto": False  # 有待处理的自动统计
             }
         
@@ -64,13 +68,12 @@ class TokenTracker(Star):
         now = time.monotonic()  # 统一时间戳
         interval_seconds = self.auto_interval_hours * 60 * 60
         
-        # 检查会话是否过期
-        if "current" in data and data["current"]:
-            start_time = data["current"].get("start_time", 0)
-            if now - start_time > self.session_ttl:
-                # 会话过期，清理
-                del self.stats[sid]
-                return False
+        # 检查会话是否过期 - 基于最后活跃时间
+        last_active = data.get("last_active_time", data.get("session_start", 0))
+        if now - last_active > self.session_ttl:
+            # 会话过期，清理
+            del self.stats[sid]
+            return False
         
         # 检查是否需要自动统计
         last_token_time = data.get("last_token_time")
@@ -91,13 +94,19 @@ class TokenTracker(Star):
             return
         
         current_stats = self.stats[sid]["current"]
+        now = time.monotonic()
+        
         if current_stats["count"] == 0:
-            return  # 没有统计记录时不输出
+            # 没有统计记录时也要清除状态
+            if sid in self.stats:
+                self.stats[sid]["pending_auto"] = False
+                self.stats[sid]["last_token_time"] = now
+                self.stats[sid]["last_active_time"] = now
+            return
         
         # 计算距离上次统计的时间
         last_token_time = self.stats[sid].get("last_token_time")
         session_start = self.stats[sid].get("session_start", 0)
-        now = time.monotonic()  # 统一时间戳
         
         if last_token_time is None:
             elapsed_hours = (now - session_start) / 3600
@@ -115,14 +124,15 @@ class TokenTracker(Star):
         
         # 重置当前统计
         self._init_session_stats(sid)
-        # 更新最后统计时间
+        # 更新最后统计时间和活跃时间
         self.stats[sid]["last_token_time"] = now
+        self.stats[sid]["last_active_time"] = now
         # 清除待处理标志
         self.stats[sid]["pending_auto"] = False
         
         logger.info(f"自动统计执行: {sid}, 消耗={current_stats['total']}tokens, 间隔={elapsed_hours:.1f}小时")
         
-        # 修复：使用event.send()而不是yield
+        # 使用event.send()发送消息
         await event.send(event.plain_result(auto_msg))
     
     @filter.on_llm_response()
@@ -136,23 +146,26 @@ class TokenTracker(Star):
                 # 标记为待处理，将在本次回复后执行
                 self.stats[sid]["pending_auto"] = True
             
-            # 记录token使用
+            # 记录token使用（带空值保护）
             usage = resp.raw_completion.usage if resp.raw_completion else None
             if usage:
                 stats = self._get_current_stats(sid)
                 
-                stats["prompt"] += usage.prompt_tokens
-                stats["completion"] += usage.completion_tokens
-                stats["total"] += usage.total_tokens
+                # 安全处理usage字段，避免None值
+                stats["prompt"] += int(usage.prompt_tokens or 0)
+                stats["completion"] += int(usage.completion_tokens or 0)
+                stats["total"] += int(usage.total_tokens or 0)
                 stats["count"] += 1
                 
-                logger.debug(f"记录token: {sid}, 本次={usage.total_tokens}, 累计={stats['total']}")
+                # 更新最后活跃时间
+                self.stats[sid]["last_active_time"] = now
+                
+                logger.debug(f"记录token: {sid}, 本次={int(usage.total_tokens or 0)}, 累计={stats['total']}")
             
-            # 清理过期会话
+            # 性能优化：按间隔清理过期会话
             self._cleanup_expired_sessions()
             
             # 如果有待处理的自动统计，执行它
-            # 修复：直接调用而不是async for循环
             if sid in self.stats and self.stats[sid].get("pending_auto", False):
                 await self._execute_auto_token(event, sid)
                 
@@ -162,14 +175,16 @@ class TokenTracker(Star):
     @filter.command("token")
     async def show_token(self, event: AstrMessageEvent):
         """显示当前对话段的token统计"""
-        # 清理过期会话
+        # 性能优化：按间隔清理过期会话
         self._cleanup_expired_sessions()
         
         sid = self._session_id(event)
+        now = time.monotonic()
         
-        # 更新最后手动统计时间
+        # 更新最后活跃时间（用户使用命令也算活跃）
         if sid in self.stats:
-            self.stats[sid]["last_token_time"] = time.monotonic()
+            self.stats[sid]["last_active_time"] = now
+            self.stats[sid]["last_token_time"] = now
             self.stats[sid]["pending_auto"] = False
         
         # 获取当前统计
@@ -194,18 +209,22 @@ class TokenTracker(Star):
         
         yield event.plain_result(msg)
     
-
-    
     def _cleanup_expired_sessions(self):
-        """清理过期会话"""
+        """清理过期会话 - 基于最后活跃时间，带性能优化"""
         now = time.monotonic()  # 统一时间戳
+        
+        # 性能优化：检查是否需要清理
+        if now - self.last_cleanup_time < self.cleanup_interval:
+            return 0  # 未到清理间隔
+        
+        self.last_cleanup_time = now
         expired_sids = []
         
         for sid, data in self.stats.items():
-            if "current" in data and data["current"]:
-                start_time = data["current"].get("start_time", 0)
-                if now - start_time > self.session_ttl:
-                    expired_sids.append(sid)
+            # 使用最后活跃时间判断过期
+            last_active = data.get("last_active_time", data.get("session_start", 0))
+            if now - last_active > self.session_ttl:
+                expired_sids.append(sid)
         
         for sid in expired_sids:
             del self.stats[sid]
