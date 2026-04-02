@@ -1,8 +1,8 @@
-import os
 import json
 import time
 import traceback
 import asyncio
+from pathlib import Path
 from typing import Dict, TypedDict, Optional
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register, StarTools
@@ -78,9 +78,9 @@ class TokenTracker(Star):
 
         # 从 StarTools 读取标准数据目录，支持持久化还原
         try:
-            data_dir = StarTools.get_data_dir()
-            os.makedirs(data_dir, exist_ok=True)
-            self._stats_file = os.path.join(data_dir, 'token_tracker_stats.json')
+            data_dir = Path(StarTools.get_data_dir())
+            data_dir.mkdir(parents=True, exist_ok=True)
+            self._stats_file = data_dir / 'token_tracker_stats.json'
         except Exception as e:
             logger.error(f"无法获取数据目录，持久化功能禁用: {e}")
             self._stats_file = None
@@ -111,7 +111,7 @@ class TokenTracker(Star):
             return
 
         try:
-            if not os.path.exists(self._stats_file):
+            if not self._stats_file.exists():
                 return
 
             with open(self._stats_file, 'r', encoding='utf-8') as f:
@@ -146,10 +146,10 @@ class TokenTracker(Star):
             return
 
         try:
-            tmp_path = f"{self._stats_file}.tmp"
+            tmp_path = self._stats_file.with_suffix('.json.tmp')
             with open(tmp_path, 'w', encoding='utf-8') as f:
                 json.dump(self.stats, f, ensure_ascii=False, indent=2)
-            os.replace(tmp_path, self._stats_file)
+            tmp_path.replace(self._stats_file)
         except Exception as e:
             logger.warning(f"持久化会话数据失败: {e}")
 
@@ -198,11 +198,16 @@ class TokenTracker(Star):
     
     def _get_session_lock(self, sid: str) -> asyncio.Lock:
         """获取或创建会话锁 - 带并发安全的原子操作"""
-        # 注：由于dict.setdefault是原子的，这里是线程安全的
-        lock = self._session_locks.setdefault(sid, asyncio.Lock())
+        # 两步判断避免每次都无条件创建 Lock 对象
+        if sid not in self._session_locks:
+            self._session_locks[sid] = asyncio.Lock()
+        
+        lock = self._session_locks[sid]
+        
         # 如果该锁先前属于过期会话并已经释放，则清理过期标记
         if sid in self._pending_cleanup_sids and not lock.locked():
             self._pending_cleanup_sids.discard(sid)
+        
         return lock
     
     def _create_default_session_data(self) -> SessionData:
